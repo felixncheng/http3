@@ -1,28 +1,40 @@
 package quic
 
+import NullOutputStream
+import Throughput
 import io.netty.bootstrap.Bootstrap
-import io.netty.buffer.ByteBuf
-import io.netty.buffer.Unpooled
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelInboundHandlerAdapter
+import io.netty.channel.ChannelInitializer
 import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.ChannelInputShutdownReadComplete
 import io.netty.channel.socket.nio.NioDatagramChannel
+import io.netty.handler.codec.http.DefaultFullHttpRequest
+import io.netty.handler.codec.http.HttpClientCodec
+import io.netty.handler.codec.http.HttpContent
+import io.netty.handler.codec.http.HttpHeaderNames
+import io.netty.handler.codec.http.HttpMethod
+import io.netty.handler.codec.http.HttpResponse
+import io.netty.handler.codec.http.HttpVersion
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory
 import io.netty.incubator.codec.quic.QuicChannel
 import io.netty.incubator.codec.quic.QuicClientCodecBuilder
 import io.netty.incubator.codec.quic.QuicSslContextBuilder
 import io.netty.incubator.codec.quic.QuicStreamChannel
 import io.netty.incubator.codec.quic.QuicStreamType
-import io.netty.util.CharsetUtil
+import io.netty.util.ReferenceCountUtil
+import processLine
 import java.net.InetSocketAddress
+import java.net.URI
 import java.util.concurrent.TimeUnit
 
 class QuicFileClient(val host: String, val port: Int) {
     fun request(path: String) {
         val context = QuicSslContextBuilder.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE)
-            .applicationProtocols("bftp").build()
+            .applicationProtocols("http/1.1").build()
         val group = NioEventLoopGroup(1)
+        val output = NullOutputStream()
+        var count = 0L
         try {
             val codec = QuicClientCodecBuilder()
                 .sslContext(context)
@@ -39,9 +51,6 @@ class QuicFileClient(val host: String, val port: Int) {
             val quicChannel = QuicChannel.newBootstrap(channel)
                 .streamHandler(object : ChannelInboundHandlerAdapter() {
                     override fun channelActive(ctx: ChannelHandlerContext) {
-                        // As we did not allow any remote initiated streams we will never see this method called.
-                        // That said just let us keep it here to demonstrate that this handle would be called
-                        // for each remote initiated stream.
                         ctx.close()
                     }
                 })
@@ -50,38 +59,66 @@ class QuicFileClient(val host: String, val port: Int) {
                 .get()
             val streamChannel = quicChannel.createStream(
                 QuicStreamType.BIDIRECTIONAL,
-                object : ChannelInboundHandlerAdapter() {
-                    override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
-                        val byteBuf = msg as ByteBuf
-                        System.err.println(byteBuf.toString(CharsetUtil.US_ASCII))
-                        byteBuf.release()
-                    }
+                object : ChannelInitializer<QuicStreamChannel>() {
+                    override fun initChannel(ch: QuicStreamChannel) {
+                        ch.pipeline().addLast(HttpClientCodec())
+                        ch.pipeline().addLast(
+                            object : ChannelInboundHandlerAdapter() {
+                                override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
+                                    if (msg is HttpResponse) {
+                                        count = msg.headers()[HttpHeaderNames.CONTENT_LENGTH].toString().toLong()
+                                        msg.headers().forEach {
+                                            println("${it.key}:${it.value}")
+                                        }
+                                    }
+                                    if (msg is HttpContent) {
+                                        val buf = msg.content()
+                                        while (buf.isReadable) {
+                                            buf.readBytes(output, buf.readableBytes())
+                                            val line = processLine(output.size, count)
+                                            print("$line\r")
+                                        }
+                                        if (count == output.size) {
+                                            println()
+                                        }
+                                        ReferenceCountUtil.release(buf)
+                                    }
+                                }
 
-                    override fun userEventTriggered(ctx: ChannelHandlerContext, evt: Any) {
-                        if (evt === ChannelInputShutdownReadComplete.INSTANCE) {
-                            // Close the connection once the remote peer did send the FIN for this stream.
-                            (ctx.channel().parent() as QuicChannel).close(
-                                true,
-                                0,
-                                ctx.alloc().directBuffer(16)
-                                    .writeBytes(
-                                        byteArrayOf(
-                                            'k'.code.toByte(),
-                                            't'.code.toByte(),
-                                            'h'.code.toByte(),
-                                            'x'.code.toByte(),
-                                            'b'.code.toByte(),
-                                            'y'.code.toByte(),
-                                            'e'.code.toByte()
+                                override fun userEventTriggered(ctx: ChannelHandlerContext, evt: Any) {
+                                    if (evt === ChannelInputShutdownReadComplete.INSTANCE) {
+                                        // Close the connection once the remote peer did send the FIN for this stream.
+                                        (ctx.channel().parent() as QuicChannel).close(
+                                            true,
+                                            0,
+                                            ctx.alloc().directBuffer(16)
+                                                .writeBytes(
+                                                    byteArrayOf(
+                                                        'k'.code.toByte(),
+                                                        't'.code.toByte(),
+                                                        'h'.code.toByte(),
+                                                        'x'.code.toByte(),
+                                                        'b'.code.toByte(),
+                                                        'y'.code.toByte(),
+                                                        'e'.code.toByte()
+                                                    )
+                                                )
                                         )
-                                    )
-                            )
-                        }
+                                    }
+                                }
+                            }
+                        )
                     }
                 }
+
             ).sync().now
+            val start = System.nanoTime()
+
+            val request = DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, URI("/$path").toASCIIString())
+            request.headers().add("Host", host)
+            request.headers().add("Connection", "close")
             // Write the data and send the FIN. After this its not possible anymore to write any more data.
-            streamChannel.writeAndFlush(Unpooled.copiedBuffer(path, CharsetUtil.US_ASCII))
+            streamChannel.writeAndFlush(request)
                 .addListener(QuicStreamChannel.SHUTDOWN_OUTPUT)
 
             // Wait for the stream channel and quic channel to be closed (this will happen after we received the FIN).
@@ -89,6 +126,9 @@ class QuicFileClient(val host: String, val port: Int) {
             streamChannel.closeFuture().sync()
             quicChannel.closeFuture().sync()
             channel.close().sync()
+            val end = System.nanoTime()
+            val throughput = Throughput(output.size, end - start)
+            println(throughput)
         } finally {
             group.shutdownGracefully()
         }

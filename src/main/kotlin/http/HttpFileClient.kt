@@ -71,6 +71,8 @@ class HttpFileClient(val ssl: Boolean, val host: String, val port: Int) {
             })
         val channel = bootstrap.connect(host, port).sync().channel()
         val request = DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, URI("/$path").toASCIIString())
+        request.headers().add("Host", host)
+        request.headers().add("Connection", "close")
         val start = System.nanoTime()
         channel.writeAndFlush(request).sync()
         channel.closeFuture().sync()

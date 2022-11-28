@@ -33,12 +33,16 @@ class Http3Client(val host: String, val port: Int) {
         .trustManager(InsecureTrustManagerFactory.INSTANCE)
         .applicationProtocols(*Http3.supportedApplicationProtocols()).build()
     private val codec: ChannelHandler = Http3.newQuicClientCodecBuilder()
-        .sslContext(context)
+        // draft-29,有些服务端需要校验版本号，这里可以指定quic version
+//        .version(-16777187)
         .maxIdleTimeout(5000, TimeUnit.MILLISECONDS)
         .initialMaxData(10000000)
         .maxRecvUdpPayloadSize((64 * 1024).toLong())
         .maxSendUdpPayloadSize((64 * 1024).toLong())
         .initialMaxStreamDataBidirectionalLocal(1000000)
+        .sslContext(context)
+        // clb必须带上sni
+//        .sslEngineProvider { context.newEngine(it.alloc(), host, port) }
         .build()
     private val bs = Bootstrap()
     private val channel: Channel = bs.group(group)
