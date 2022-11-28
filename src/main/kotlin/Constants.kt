@@ -3,6 +3,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 
+const val TCP_PORT = 9996
 const val HTTP_PORT = 9997
 const val HTTPS_PORT = 9998
 const val HTTP3_PORT = 9999
